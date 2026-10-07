@@ -226,17 +226,21 @@ _builtins.print = _cprint
 
 """Bitwarden Server 2026.9.2 EF cipher create skips collection ACL. Loopback lab client."""
 
-import os
 import subprocess
 import sys
+from pathlib import Path
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-LAB = os.path.join(HERE, "lab")
+HERE = Path(__file__).resolve().parent
+LAB = HERE / "lab"
 
 
 def main() -> int:
-    os.chdir(LAB)
-    return subprocess.call(["bash", os.path.join(LAB, "run.sh"), *sys.argv[1:]])
+    completed = subprocess.run(
+        ["bash", str(LAB / "run.sh"), *sys.argv[1:]],
+        cwd=LAB,
+        check=False,
+    )
+    return int(completed.returncode)
 
 
 if __name__ == "__main__":

