@@ -13,6 +13,10 @@
   &nbsp;·&nbsp;
   <a href="https://github.com/abraxas/bitwarden-cipher-create-acl">bitwarden-cipher-create-acl</a>
 </p>
+<p align="center">
+  Write-up: <a href="https://abraxaslabs.tech/research/bitwarden-cipher-create-acl"><strong>https://abraxaslabs.tech/research/bitwarden-cipher-create-acl</strong></a>
+</p>
+
 
 # bitwarden-cipher-create-acl
 
